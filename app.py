@@ -178,15 +178,79 @@ def extract_page_signals(url: str, html: str) -> str:
     return "\n\n".join(out)
 
 
-def _is_blocked(status: int, html: str) -> bool:
-    """Return True if the response looks like a bot-block or CF challenge."""
-    if status in (403, 429, 503):
-        return True
-    markers = ["just a moment", "_cf_chl_", "cf-browser-verification",
-               "enable javascript", "checking your browser", "host not in allowlist",
-               "access denied", "403 forbidden"]
-    snippet = html[:3000].lower()
-    return any(m in snippet for m in markers)
+def _detect_block_or_empty(status: int, html: str, url: str) -> tuple[bool, str]:
+    """
+    Combined block and emptiness detector. Returns (is_bad, reason).
+    Runs BEFORE any signal extraction. If this returns True, we do not score,
+    we do not send to Gemini, we surface an error and prompt the user to paste
+    raw HTML instead.
+    """
+    # Signal 1: HTTP status
+    if status in (401, 403, 429, 503):
+        return True, f"HTTP {status} response (likely bot block or rate limit)"
+
+    # Signal 2: response too small to be a real page
+    if len(html) < 2000:
+        return True, f"Response body only {len(html)} bytes (likely a block or error page)"
+
+    # Signal 3: known WAF and bot-challenge fingerprints
+    snippet = html[:5000].lower()
+    fingerprints = {
+        "just a moment":              "Cloudflare bot challenge",
+        "_cf_chl_":                   "Cloudflare bot challenge",
+        "cf-browser-verification":    "Cloudflare bot challenge",
+        "cf_chl_opt":                 "Cloudflare bot challenge",
+        "checking your browser":      "Cloudflare bot challenge",
+        "attention required":         "Cloudflare block",
+        "ray id":                     "Cloudflare block page",
+        "access denied":              "Access denied response",
+        "403 forbidden":              "403 Forbidden response",
+        "enable javascript and cookies to continue": "Bot challenge (JS+cookies required)",
+        "ak-bmsc":                    "Akamai bot manager challenge",
+        "reference #18.":             "Akamai bot manager challenge",
+        "px-captcha":                 "PerimeterX challenge",
+        "dd-protection":              "DataDome challenge",
+        "incapsula":                  "Imperva Incapsula challenge",
+        "distil_r_captcha":           "Distil Networks challenge",
+    }
+    for marker, description in fingerprints.items():
+        if marker in snippet:
+            return True, description
+
+    # Signal 4: title heuristics
+    _soup = BeautifulSoup(html, "html.parser")
+    _title_tag = _soup.find("title")
+    if _title_tag and _title_tag.string:
+        _title = _title_tag.string.strip().lower()
+        block_titles = [
+            "just a moment", "access denied", "attention required",
+            "please wait", "403 forbidden", "you have been blocked",
+            "security check", "checking your browser",
+        ]
+        if any(bt in _title for bt in block_titles):
+            return True, f"Blocking page title: {_title_tag.string.strip()[:80]}"
+
+    # Signal 5: structural emptiness
+    # A real page has headings, links, and paragraphs. Challenge pages do not.
+    # This catches blocks even when no fingerprint matches, which is what
+    # went wrong on Bettys.
+    for t in _soup(["script", "style", "noscript"]):
+        t.decompose()
+    body = _soup.find("body")
+    if body:
+        h1_count   = len(body.find_all("h1"))
+        h_count    = len(body.find_all(["h1", "h2", "h3"]))
+        link_count = len(body.find_all("a", href=True))
+        p_count    = len(body.find_all("p"))
+        body_text  = body.get_text(" ", strip=True)
+        if h_count == 0 and link_count < 3 and p_count < 3:
+            return True, (
+                f"Page appears empty (h1={h1_count}, headings={h_count}, "
+                f"links={link_count}, paragraphs={p_count}, body chars={len(body_text)}). "
+                "Likely a bot-block, WAF challenge, or JS-only shell."
+            )
+
+    return False, ""
 
 
 def _is_js_shell(html: str) -> bool:
@@ -237,34 +301,54 @@ def _fetch_wayback(url: str, session: requests.Session) -> tuple:
 def fetch_single_page(url: str, session: requests.Session) -> tuple:
     """
     Multi-strategy fetcher. Returns (signals_text, fetch_note).
-    Strategy: direct → Wayback fallback.
+    Strategy: direct, then Wayback fallback. If both fail or return
+    blocked/empty content, returns a FETCH_BLOCKED marker that the
+    orchestrator surfaces to the user with a prompt to paste raw HTML.
     """
     fetch_note = ""
     html = ""
+    label = ""
+    block_reason = ""
+    direct_error = ""
 
-    # ── Strategy 1: direct fetch ──────────────────────────────────
+    # Strategy 1: direct fetch
     try:
         html, status, label = _fetch_direct(url, session)
-        if _is_blocked(status, html):
-            raise ValueError(f"Blocked (status {status})")
+        is_bad, reason = _detect_block_or_empty(status, html, url)
+        if is_bad:
+            block_reason = reason
+            raise ValueError(reason)
     except Exception as e:
-        # ── Strategy 2: Wayback Machine ───────────────────────────
+        direct_error = str(e)
+        # Strategy 2: Wayback Machine
         try:
             html, status, label = _fetch_wayback(url, session)
+            is_bad, reason = _detect_block_or_empty(status, html, url)
+            if is_bad:
+                # Wayback also returned junk. Give up and surface the block.
+                return (
+                    f"URL: {url}\n\n[FETCH_BLOCKED: {block_reason or direct_error}. "
+                    f"Wayback fallback also returned unusable content: {reason}. "
+                    "Paste the raw HTML for this URL using the 'Site blocked?' "
+                    "expander below the URL inputs.]",
+                    "blocked"
+                )
             fetch_note = (
-                f"SOURCE_NOTE: Direct fetch was blocked ({e}). "
-                f"Content retrieved from {label} — reflects how AI crawlers "
-                "that use cached/crawled versions see this page."
+                f"SOURCE_NOTE: Direct fetch was blocked ({block_reason or direct_error}). "
+                f"Content retrieved from {label}, reflects how AI crawlers "
+                "that use cached versions see this page."
             )
         except Exception as e2:
             return (
-                f"URL: {url}\n\n[FETCH_FAILED: Could not retrieve page directly ({e}) "
-                f"or from Wayback Machine ({e2}). "
-                "The site may be heavily protected. Try pasting the page HTML manually.]",
-                ""
+                f"URL: {url}\n\n[FETCH_BLOCKED: Direct fetch failed ({direct_error}). "
+                f"Wayback fetch also failed ({e2}). "
+                "The site is either heavily bot-protected or unreachable. "
+                "Paste the raw HTML for this URL using the 'Site blocked?' "
+                "expander below the URL inputs.]",
+                "blocked"
             )
 
-    # ── Detect JS shell ───────────────────────────────────────────
+    # Detect JS shell (still useful for legitimate React/Next/Vue sites)
     is_shell = _is_js_shell(html)
     signals  = extract_page_signals(url, html)
 
@@ -1503,11 +1587,16 @@ if run:
 
     pages = fetch_pages(domain, extra_urls, pasted_html or None)
 
-    # Show what actually happened per URL
+    # Show what actually happened per URL and separate blocked from usable
     fetch_log = []
+    blocked_urls = []
     for url, signals in pages.items():
-        if "FETCH_FAILED" in signals:
-            fetch_log.append(f"❌ **{url}** — fetch failed (see details in audit)")
+        if "FETCH_BLOCKED" in signals:
+            fetch_log.append(f"🚫 **{url}** — blocked, cannot be scored")
+            blocked_urls.append(url)
+        elif "FETCH_FAILED" in signals:
+            fetch_log.append(f"❌ **{url}** — fetch failed")
+            blocked_urls.append(url)
         elif "Wayback Machine" in signals:
             fetch_log.append(f"🗄️ **{url}** — retrieved via Wayback Machine cache")
         elif "manually provided" in signals:
@@ -1516,6 +1605,25 @@ if run:
             fetch_log.append(f"⚠️ **{url}** — JS-rendered site (shell only)")
         else:
             fetch_log.append(f"✅ **{url}** — fetched successfully")
+
+    # Hard gate: if any URLs are blocked, halt before Gemini
+    if blocked_urls:
+        fetch_status.error(
+            f"❌ **{len(blocked_urls)} of {len(pages)} pages could not be fetched.**\n\n"
+            + "\n".join(fetch_log)
+            + "\n\n---\n\n"
+            + "**These pages appear to be blocked by bot protection (Cloudflare, Akamai, etc.) "
+            + "or returned an empty response.**\n\n"
+            + "To continue, get the raw HTML for the blocked URLs:\n"
+            + "1. Open each blocked URL in your browser\n"
+            + "2. Right-click, then **View Page Source** (or press Ctrl+U / Cmd+Option+U)\n"
+            + "3. Select all (Ctrl+A / Cmd+A), copy (Ctrl+C / Cmd+C)\n"
+            + "4. Open the **'Site blocked?'** expander above and paste the HTML against the URL\n"
+            + "5. Click **Run audit** again\n\n"
+            + "Scoring these pages without their real HTML would produce false results, "
+            + "so the audit has been stopped."
+        )
+        st.stop()
 
     fetch_status.success(
         f"Fetched {len(pages)} page(s). Running Gemini audit…\n\n" +
