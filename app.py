@@ -56,6 +56,7 @@ def extract_page_signals(url: str, html: str) -> str:
     what an AI auditor needs: meta, schema, headings, links, alt text, ARIA.
     This keeps each page under ~2000 tokens while preserving all audit signals.
     """
+    import re as _re
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript", "svg", "path"]):
         tag.decompose()
@@ -85,29 +86,188 @@ def extract_page_signals(url: str, html: str) -> str:
     out.append("META:\n" + "\n".join(meta_items[:20] + link_tags[:5]))
 
     # ── Schema / JSON-LD ──────────────────────────────────────────────
+    # Instead of sending truncated raw JSON (which makes Gemini incorrectly
+    # flag pages as having "truncated schema"), we summarise each schema
+    # block: type, key fields, and validity. This works even for PLPs with
+    # dozens of Product schemas — each is summarised, not truncated.
+    import json as _json
+
+    def _schema_summary(obj, depth=0):
+        """Return a short human summary of a schema.org object."""
+        if depth > 3:
+            return "..."
+        if isinstance(obj, list):
+            # ItemList / array — summarise count and first item's type
+            if not obj:
+                return "empty list"
+            first_type = "?"
+            if isinstance(obj[0], dict):
+                first_type = obj[0].get("@type", "?")
+            return f"list of {len(obj)} items (first @type={first_type})"
+        if not isinstance(obj, dict):
+            return type(obj).__name__
+        typ = obj.get("@type", "?")
+        # Handle @graph — array of nested schemas
+        if "@graph" in obj and isinstance(obj["@graph"], list):
+            types_in_graph = [g.get("@type","?") if isinstance(g,dict) else "?" for g in obj["@graph"]]
+            return f"@graph with {len(obj['@graph'])} nodes: {', '.join(types_in_graph[:10])}"
+        # Extract useful fields based on type.
+        # Fields where we expand nested sub-fields so Gemini can see what is
+        # actually populated. Only REQUIRED sub-fields are ever reported as
+        # "missing" — optional ones are simply omitted when absent, so the
+        # word "missing" only appears for genuine gaps, not for fields most
+        # sites never populate (e.g. priceValidUntil, author url, publisher logo).
+        NESTED_FIELDS_REQUIRED = {
+            "address":   ["streetAddress","addressLocality","postalCode","addressCountry"],
+            "offers":    ["price","priceCurrency","availability"],
+            "author":    ["name"],
+            "publisher": ["name"],
+        }
+        NESTED_FIELDS_OPTIONAL = {
+            "address":   ["addressRegion"],
+            "offers":    ["url","priceValidUntil"],
+            "author":    ["url"],
+            "publisher": ["url","logo"],
+        }
+
+        useful = []
+        for k in ["name","headline","url","description","datePublished","dateModified",
+                  "author","publisher","offers","aggregateRating","brand","sku",
+                  "image","logo","email","telephone","address","itemListElement"]:
+            if k in obj:
+                v = obj[k]
+                if isinstance(v, (dict, list)):
+                    if k == "itemListElement" and isinstance(v, list):
+                        useful.append(f"{k}=[{len(v)} items]")
+                    elif isinstance(v, dict) and k in NESTED_FIELDS_REQUIRED:
+                        required = NESTED_FIELDS_REQUIRED[k]
+                        optional = NESTED_FIELDS_OPTIONAL.get(k, [])
+                        present_req = [sf for sf in required if v.get(sf)]
+                        missing_req = [sf for sf in required if not v.get(sf)]
+                        present_opt = [sf for sf in optional if v.get(sf)]
+                        nested_type = v.get("@type", "?")
+                        all_present = present_req + present_opt
+                        detail = f"present: {', '.join(all_present) if all_present else 'none'}"
+                        if missing_req:
+                            detail += f" | missing required: {', '.join(missing_req)}"
+                        useful.append(f"{k}={{{nested_type}: {detail}}}")
+                    elif isinstance(v, dict):
+                        useful.append(f"{k}={{{v.get('@type','?')}}}")
+                    else:
+                        useful.append(f"{k}=[{len(v)}]")
+                else:
+                    val = str(v)[:60]
+                    useful.append(f"{k}='{val}'")
+        return f"@type={typ}" + ((" " + ", ".join(useful)) if useful else "")
+
+    def _parse_json_loose(txt):
+        """Try to parse JSON, stripping common issues (comments, trailing commas)."""
+        txt = txt.strip()
+        try:
+            return _json.loads(txt)
+        except _json.JSONDecodeError:
+            # Try stripping trailing commas
+            cleaned = _re.sub(r",\s*([}\]])", r"\1", txt)
+            try:
+                return _json.loads(cleaned)
+            except _json.JSONDecodeError:
+                return None
+
     schemas = []
-    for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
-        txt = s.string or s.get_text()
-        if txt and txt.strip():
-            schemas.append(txt.strip()[:500])
-    # Fallback: regex search raw HTML in case BeautifulSoup missed it
-    if not schemas:
-        import re as _re
-        raw_schemas = _re.findall(
+    schema_scripts = list(soup.find_all("script", attrs={"type": "application/ld+json"}))
+    # Fallback: raw HTML regex if BeautifulSoup missed any
+    raw_blocks = []
+    if not schema_scripts:
+        raw_blocks = _re.findall(
             r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
             html, _re.DOTALL | _re.IGNORECASE
         )
-        schemas = [s.strip()[:500] for s in raw_schemas if s.strip()]
-    out.append("SCHEMA_JSON_LD: " + ("; ".join(schemas) if schemas else "NONE FOUND"))
+
+    schema_sources = [(s.string or s.get_text()) for s in schema_scripts] or raw_blocks
+    total_blocks = len(schema_sources)
+
+    for i, raw_txt in enumerate(schema_sources):
+        if not raw_txt or not raw_txt.strip():
+            continue
+        parsed = _parse_json_loose(raw_txt)
+        if parsed is None:
+            # Note the parse error — this IS a real signal Gemini should see
+            schemas.append(f"BLOCK {i+1}: PARSE_ERROR (invalid JSON, {len(raw_txt)} chars)")
+        else:
+            summary = _schema_summary(parsed)
+            schemas.append(f"BLOCK {i+1}: {summary}")
+
+    if schemas:
+        out.append(
+            f"SCHEMA_JSON_LD ({total_blocks} block(s) found, all summarised — NOT truncated):\n"
+            + "\n".join(schemas)
+        )
+    else:
+        out.append("SCHEMA_JSON_LD: NONE FOUND")
+
+    # ── Pre-labelled dates ────────────────────────────────────────────
+    # Extract every date-like value from schema markup and meta tags,
+    # then label each as PAST or FUTURE against today's real date.
+    # This means Gemini never has to decide "is 2026 in the future?".
+    from datetime import date as _date
+    today = _date.today()
+    date_findings = []
+    # Combine all schema JSON-LD content + full raw HTML for date scanning
+    scan_text = " ".join(schemas) + " " + html
+    # ISO-style dates like 2026-06-02 or 2026-06-02T12:34:56
+    iso_pattern = _re.compile(r'\b(20\d{2})-(\d{2})-(\d{2})(?:T\d{2}:\d{2}[\d:.+\-Z]*)?\b')
+    seen = set()
+    for m in iso_pattern.finditer(scan_text):
+        raw_date = m.group(0)
+        if raw_date in seen:
+            continue
+        seen.add(raw_date)
+        try:
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            found = _date(y, mo, d)
+            label = "PAST" if found <= today else "FUTURE"
+            # Find nearby context (60 chars before) to help identify what field this is
+            start = max(0, m.start() - 60)
+            context = scan_text[start:m.start()].strip()[-40:]
+            date_findings.append(f"{raw_date} [{label}] ...{context}")
+        except ValueError:
+            continue
+        if len(date_findings) >= 15:
+            break
+
+    if date_findings:
+        out.append(
+            f"DATES_FOUND (today is {today.isoformat()}):\n" + "\n".join(date_findings)
+        )
+    else:
+        out.append(f"DATES_FOUND (today is {today.isoformat()}): NONE FOUND")
 
     # ── Heading structure ─────────────────────────────────────────────
-    headings = []
+    # Collect headings by level so H1s are never crowded out by nav H2/H3s.
+    # Also include an H1 count so Gemini can spot multiple-H1 problems.
+    heads_by_level = {"h1": [], "h2": [], "h3": [], "h4": []}
     for tag in soup.find_all(["h1","h2","h3","h4"]):
-        txt = tag.get_text(" ", strip=True)[:80]
-        if txt:
-            headings.append(f"<{tag.name}>{txt}</{tag.name}>")
-        if len(headings) >= 20: break
-    out.append("HEADINGS:\n" + ("\n".join(headings) if headings else "NONE FOUND"))
+        txt = tag.get_text(" ", strip=True)[:100]
+        if txt and tag.name in heads_by_level:
+            heads_by_level[tag.name].append(txt)
+
+    # Fallback: some CMSs use role="heading" with aria-level instead of real h1-h6
+    if not heads_by_level["h1"]:
+        for tag in soup.find_all(attrs={"role":"heading"}):
+            level = tag.get("aria-level","1")
+            txt = tag.get_text(" ", strip=True)[:100]
+            if txt and str(level) == "1":
+                heads_by_level["h1"].append(txt + " [role=heading aria-level=1]")
+
+    h1_count = len(heads_by_level["h1"])
+    heading_lines = [f"H1 COUNT: {h1_count}"]
+    for lvl in ["h1","h2","h3","h4"]:
+        # Always include ALL h1s; cap h2/h3/h4 at 8 each so we don't blow the budget
+        cap = None if lvl == "h1" else 8
+        items = heads_by_level[lvl][:cap] if cap else heads_by_level[lvl]
+        for txt in items:
+            heading_lines.append(f"<{lvl}>{txt}</{lvl}>")
+    out.append("HEADINGS:\n" + ("\n".join(heading_lines) if h1_count or any(heads_by_level.values()) else "NONE FOUND"))
 
     # ── ARIA usage ────────────────────────────────────────────────────
     aria_items = []
@@ -169,11 +329,59 @@ def extract_page_signals(url: str, html: str) -> str:
         except Exception:
             pass
 
-    # ── Body content sample (for LLM signal) ─────────────────────────
+    # ── Body content sample (for LLM & CONTENT signal) ───────────────
+    # Priority order: prefer <main>, then <article>, then a #content /
+    # role="main" container, then finally fall back to <body> minus the
+    # nav/header/footer. This ensures we sample the ACTUAL page content
+    # (product descriptions, article body, etc.) not the mega-menu.
+    body_sample = ""
+    main_candidates = []
+
+    # Try semantic containers first
+    for selector in [
+        {"name": "main"},
+        {"name": "article"},
+        {"attrs": {"role": "main"}},
+        {"attrs": {"id": _re.compile(r"main|content|product", _re.I)}},
+        {"attrs": {"class": _re.compile(r"product-description|product-details|product__description|main-content|page-content|article-body|entry-content|post-content", _re.I)}},
+    ]:
+        try:
+            found = soup.find_all(**selector)
+        except Exception:
+            found = []
+        for f in found:
+            txt = " ".join(f.get_text(" ", strip=True).split())
+            if len(txt) > 100:
+                main_candidates.append(txt)
+        if main_candidates:
+            break
+
+    if main_candidates:
+        # Use the longest main candidate — biggest content block wins
+        main_candidates.sort(key=len, reverse=True)
+        body_sample = main_candidates[0][:3500]
+        out.append(f"MAIN_CONTENT (from semantic container):\n{body_sample}")
+    else:
+        # Fallback: full body minus nav/header/footer/aside
+        body = soup.find("body")
+        if body:
+            body_copy = BeautifulSoup(str(body), "html.parser")
+            for junk in body_copy(["nav","header","footer","aside","form"]):
+                junk.decompose()
+            # Also strip common nav/footer class patterns
+            for junk in body_copy.find_all(
+                attrs={"class": _re.compile(r"nav|menu|header|footer|cookie|banner|breadcrumb|sidebar", _re.I)}
+            ):
+                junk.decompose()
+            text = " ".join(body_copy.get_text(" ", strip=True).split())[:3500]
+            out.append(f"BODY_TEXT_SAMPLE (nav stripped):\n{text}")
+
+    # Also include a shorter raw body sample so Gemini can still audit
+    # nav content signals like "Shop by Category" etc.
     body = soup.find("body")
     if body:
-        text = " ".join(body.get_text(" ", strip=True).split())[:1500]
-        out.append(f"BODY_TEXT_SAMPLE:\n{text}")
+        raw_snippet = " ".join(body.get_text(" ", strip=True).split())[:800]
+        out.append(f"RAW_BODY_START (first 800 chars including nav):\n{raw_snippet}")
 
     return "\n\n".join(out)
 
@@ -446,11 +654,24 @@ def fetch_pages(domain: str, extra_urls: list[str],
 AUDIT_PROMPT = """
 You are an expert AI visibility auditor. Audit the provided HTML pages exactly like a senior technical SEO and AI readiness consultant would.
 
+DATE CONTEXT (READ FIRST):
+The value {TODAY_DATE} at the end of the "Pages to audit" section is the current real-world date the audit is being run. Trust this value absolutely. Compare every date you see in schema markup, meta tags, article publish dates or last-modified dates against this reference date to decide whether it is past or future. Do NOT rely on your own knowledge of what year "should" be current. If a date is on or before {TODAY_DATE} it is in the past. If it is after {TODAY_DATE} it is in the future.
+
 Score EACH page 1-10 across these 9 dimensions:
 1. ARIA – landmark roles, aria-labels, accessibility for AI parsers
-2. SCHEMA – schema.org JSON-LD structured data presence and quality
+2. SCHEMA – schema.org JSON-LD structured data presence and quality.
+   The schema summary shows nested objects (address, offers, author, publisher) with a "present" list and, only when relevant, a "missing required" list. Optional sub-fields (e.g. addressRegion, priceValidUntil, author/publisher url, publisher logo) are never listed as missing, they are simply included in "present" when populated and left out entirely when absent. This means a nested object with no "missing required" entry is fully complete, do not describe it as a stub, placeholder or incomplete. Base every completeness judgement strictly on the "missing required" list, and treat anything not flagged there as complete.
+   Each SCHEMA_JSON_LD block is a compressed summary, not truncated raw JSON, the header explicitly says so. Do NOT report schema as "truncated" based on the summary format itself.
 3. HEADINGS – H1-H6 hierarchy, clarity, topic signal
-4. META – title, description, canonical, Open Graph, Twitter Card
+4. META – Score based on what AI crawlers actually use, not social sharing signals. Use these criteria:
+   HIGH-WEIGHT signals (drive most of the score): unique descriptive <title>, meta description, canonical URL, lang attribute, robots directive, viewport. These are what AI crawlers use to understand and cite a page.
+   LOW-WEIGHT signals (should contribute at most 1-2 points): Open Graph tags (og:title, og:description, og:image, og:type), Twitter Card tags. These are for social media previews, not AI citation. A page with only OG tags but no proper title or description should score 3-4, not 7-8.
+   SCORE 1-3 (Poor): Missing title, no meta description, no canonical, or duplicate meta across many pages.
+   SCORE 4-5 (Moderate): Has title and description but they are generic, templated, or missing canonical. OG tags present but core meta weak.
+   SCORE 6-7 (Good): Bespoke title and description per page, correct canonical, proper lang, robots configured. OG tags present as a bonus.
+   SCORE 8-9 (Excellent): All of the above plus considered use of og:type per content type (e.g. product on PDPs, article on blog), hreflang for international sites, structured meta that reinforces the page topic.
+   SCORE 10: Reserved for exemplary implementations across every metadata surface.
+   IMPORTANT: Do NOT award high META scores just because Open Graph is comprehensive. OG tags improve social sharing appearance, they do not meaningfully improve AI visibility. The core AI signals are title, description, canonical and lang.
 5. LINKS – internal link quality, anchor text, protocol consistency, density
 6. ALT TEXT – image alt attribute quality and completeness
 7. CRAWL – server-rendered static HTML vs JS dependency
@@ -462,6 +683,8 @@ Score EACH page 1-10 across these 9 dimensions:
    SCORE 8-9 (Excellent): Genuinely user-centric throughout. Addresses the buyer's specific situation, problem or goal. Uses outcome language ("achieve a spa-like experience at home", "save X", "eliminate Y problem"). Anticipates and answers specific buying questions. Cites proof points (reviews, stats, expert recommendation).
    SCORE 10: Reserved for editorial or guide content that is comprehensive, cites sources, names experts, and fully answers a user's question with no gaps.
    IMPORTANT: A product page that simply lists specifications and says "free delivery" scores NO HIGHER than 4. A category page that lists products with no explanatory copy scores 1-2.
+
+   CRITICAL SCORING RULE: Score ONLY on the content you can actually see in the MAIN_CONTENT and BODY_TEXT_SAMPLE fields. Do NOT assume, infer, or hope that expanded content exists beyond what is shown. If the extracted content is thin, the page IS thin — score it accordingly. Never write phrases like "assuming the full description expands on this" or "if the page includes more detail" — if you did not see the content, it does not count. If a product page's visible content is just the product name, price, and a spec list, score 1-3 regardless of what OG or schema description says. Meta and schema descriptions are marketing summaries, they are NOT the on-page content and do not count toward CONTENT QUALITY scoring.
 
 CRITICAL RULES FOR JSON:
 - Return ONLY raw JSON. No markdown, no ```json fences, no preamble, no explanation.
@@ -590,13 +813,23 @@ def repair_and_parse(raw: str) -> dict:
 
 
 def run_audit(model, pages: dict) -> dict:
+    from datetime import date as _date
+    today_iso = _date.today().isoformat()
+    today_readable = _date.today().strftime("%d %B %Y")
+
     # pages values are already compact signal summaries from extract_page_signals
     pages_text = ""
     for url, signals in pages.items():
         pages_text += f"\n\n{'='*60}\n{signals}\n"
 
+    # Inject the current date so Gemini has ground truth for past/future checks.
+    # Gemini's training cutoff means it cannot reliably reason about dates in 2025+.
+    pages_text += f"\n\n{'='*60}\nTODAY_DATE: {today_iso} ({today_readable})\n"
+
+    prompt = AUDIT_PROMPT.replace("{TODAY_DATE}", today_iso)
+
     response = model.generate_content(
-        AUDIT_PROMPT + "\n\nPages to audit:\n" + pages_text,
+        prompt + "\n\nPages to audit:\n" + pages_text,
         generation_config={
             "temperature": 0.1,
             "max_output_tokens": 65536,   # 2.5-flash supports up to 65k output tokens
